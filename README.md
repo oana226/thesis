@@ -1,80 +1,189 @@
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score, mean_squared_error
-import statsmodels.api as sm
-mech = "stiff"
-geom = "abs_curvature"
+from nibabel.freesurfer.io import read_annot
+from cortech import freesurfer
+from scipy.stats import spearmanr
+from statsmodels.stats.multitest import fdrcorrection
 
-area = "S_front_inf"
+import nibabel as nib
+import numpy as np
+import pandas as pd
+from pathlib import Path
 
-rows = []
 
-for sub in subject_data_on_fsaverage.keys():
+# OUTPUT DIRECTORY
 
-    x_all = []
-    y_all = []
+
+region_dir = Path("/home/oana/MRE_group_results/region_correlations")
+region_dir.mkdir(exist_ok=True)
+
+
+# LOAD ATLAS
+
+
+labels = {
+    "lh": read_annot(
+        freesurfer.HOME / "subjects/fsaverage/label/lh.aparc.a2009s.annot"
+    ),
+    "rh": read_annot(
+        freesurfer.HOME / "subjects/fsaverage/label/rh.aparc.a2009s.annot"
+    )
+}
+
+region_names = [
+    r.decode("utf-8")
+    for r in labels["lh"][2]
+]
+
+subs = list(subject_data_on_fsaverage.keys())
+
+
+# PARAMETER PAIRS
+
+
+pairs = [
+    ("stiff", "curvature"),
+    ("stiff", "sulcal_depth"),
+    ("stiff", "thickness"),
+]
+
+
+# LOOP PAIRS
+
+
+for x_feat, y_feat in pairs:
+
+    print(f"\n{x_feat} vs {y_feat}")
+
+    rows = []
+
+    # -------------------------------------------------
+    # COMPUTE REGION-WISE CORRELATIONS
+    # -------------------------------------------------
+
+    for region_idx, region_name in enumerate(region_names):
+
+        if region_name == "unknown":
+            continue
+
+        all_x = []
+        all_y = []
+
+        for sub in subs:
+
+            xd = subject_data_on_fsaverage[sub].get(x_feat)
+            yd = subject_data_on_fsaverage[sub].get(y_feat)
+
+            if xd is None or yd is None:
+                continue
+
+            for hemi in ["lh", "rh"]:
+
+                mask = labels[hemi][0] == region_idx
+
+                xv = xd[hemi][mask]
+                yv = yd[hemi][mask]
+
+                valid = np.isfinite(xv) & np.isfinite(yv)
+
+                all_x.extend(xv[valid])
+                all_y.extend(yv[valid])
+
+        if len(all_x) < 20:
+            continue
+
+        r, p = spearmanr(all_x, all_y)
+
+        rows.append({
+            "region": region_name,
+            "r": r,
+            "p": p,
+            "n": len(all_x)
+        })
+
+    
+    # DATAFRAME
+    
+
+    df_r = pd.DataFrame(rows)
+
+    # FDR correction
+    _, df_r["p_fdr"] = fdrcorrection(
+        df_r["p"],
+        alpha=0.05
+    )
+
+    df_r["significant"] = df_r["p_fdr"] < 0.05
+
+    # Save CSV
+    df_r.to_csv(
+        region_dir / f"{x_feat}_vs_{y_feat}_regional_stats.csv",
+        index=False
+    )
+
+    
+    # CREATE SURFACE MAPS
+    
 
     for hemi in ["lh", "rh"]:
 
-        region_idx = parcel_labels[area][hemi]
+        vertex_labels = labels[hemi][0]
+        n_vertices = len(vertex_labels)
 
-        mask = labels[hemi][0] == region_idx
+        r_map = np.zeros(n_vertices)
+        r_fdr_map = np.zeros(n_vertices)
+        p_map = np.zeros(n_vertices)
 
-        geom_data = subject_data_on_fsaverage[sub][geom][hemi]
-        mech_data = subject_data_on_fsaverage[sub][mech][hemi]
+        for region_idx, region_name in enumerate(region_names):
 
-        if geom_data is None or mech_data is None:
-            continue
+            if region_name == "unknown":
+                continue
 
-    
-        x = geom_data[mask]
-        y = mech_data[mask]
+            mask = vertex_labels == region_idx
 
-        valid = np.isfinite(x) & np.isfinite(y)
+            row = df_r[df_r["region"] == region_name]
 
-        x_all.extend(x[valid])
-        y_all.extend(y[valid])
+            if len(row) == 0:
+                continue
 
-    # store all vertices from this subject
-    for xv, yv in zip(x_all, y_all):
+            r_val = row["r"].values[0]
+            p_val = row["p_fdr"].values[0]
+            sig = row["significant"].values[0]
 
-        rows.append({
-            "subject": sub,
-            geom: xv,
-            mech: yv
-        })
+            # all correlations
+            r_map[mask] = r_val
 
-df = pd.DataFrame(rows)
+            # significance map
+            p_map[mask] = -np.log10(p_val + 1e-300)
 
-subjects = df["subject"].unique()
+            # FDR-only map
+            if sig:
+                r_fdr_map[mask] = r_val
 
-train_subjects, test_subjects = train_test_split(subjects, test_size=0.2, random_state=42)
+        
+        # SAVE MAPS
+        
 
-train_df = df[df["subject"].isin(train_subjects)]
-test_df  = df[df["subject"].isin(test_subjects)]
+        nib.save(
+            nib.freesurfer.mghformat.MGHImage(
+                r_map.astype("float32"),
+                np.eye(4)
+            ),
+            region_dir / f"{hemi}.{x_feat}_vs_{y_feat}.regional_r.mgh"
+        )
 
-X_train = train_df[[geom]]
-y_train = train_df[mech]
+        nib.save(
+            nib.freesurfer.mghformat.MGHImage(
+                r_fdr_map.astype("float32"),
+                np.eye(4)
+            ),
+            region_dir / f"{hemi}.{x_feat}_vs_{y_feat}.regional_r_fdr.mgh"
+        )
 
-X_test = test_df[[geom]]
-y_test = test_df[mech]
+        nib.save(
+            nib.freesurfer.mghformat.MGHImage(
+                p_map.astype("float32"),
+                np.eye(4)
+            ),
+            region_dir / f"{hemi}.{x_feat}_vs_{y_feat}.regional_neglog10p.mgh"
+        )
 
-model = LinearRegression()
-
-model.fit(X_train, y_train)
-
-y_pred = model.predict(X_test)
-
-r2 = r2_score(y_test, y_pred)
-
-rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-
-print(f"R²: {r2:.3f}")
-print(f"RMSE: {rmse:.3f}")
-
-X_train_sm = sm.add_constant(X_train)
-
-ols_model = sm.OLS(y_train, X_train_sm).fit()
-
-print(ols_model.summary())
-
+    print("Saved maps")
